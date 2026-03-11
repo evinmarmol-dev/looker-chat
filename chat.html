@@ -2,51 +2,177 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>E‑Vin Chat</title>
 <style>
-body { font-family: Arial; background:#f7f7f7; }
-#chat { max-width: 600px; margin: auto; background: white; padding: 10px; }
-.msg { margin: 8px 0; }
-.user { font-weight: bold; }
-.bot { color: #0b5cff; }
+  :root { --bg:#f7f7f7; --fg:#111; --bot:#0b5cff; --card:#fff; --muted:#666; }
+  body { font-family: system-ui, Arial, sans-serif; background:var(--bg); color:var(--fg); margin:0; }
+  #chat { max-width: 720px; margin: 24px auto; background: var(--card); border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,.06); overflow: hidden; }
+  #messages { padding: 16px; height: 62vh; overflow-y: auto; }
+  .msg { margin: 10px 0; line-height: 1.45; }
+  .msg .role { font-weight: 600; margin-right: 6px; }
+  .msg.user .role { color: var(--fg); }
+  .msg.bot  .role { color: var(--bot); }
+  .bubble { display: inline-block; padding: 10px 12px; border-radius: 10px; background: #f2f5ff; }
+  .msg.user .bubble { background:#f2f2f2; }
+  .muted { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  form { display: flex; gap: 8px; padding: 12px; background: #fafafa; border-top: 1px solid #eee; }
+  input[type="text"] { flex: 1; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 16px; }
+  button { padding: 12px 16px; border: 0; border-radius: 8px; color: #fff; background: var(--bot); font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .65; cursor: not-allowed; }
+  a { color: var(--bot); text-decoration: underline; word-break: break-word; }
 </style>
 </head>
 <body>
 
 <div id="chat">
   <div id="messages"></div>
-  <input id="q" placeholder="Escribe tu pregunta..." style="width:80%" />
-  <button onclick="send()">Enviar</button>
+  <form id="f" autocomplete="off">
+    <input id="q" type="text" placeholder="Escribe tu pregunta y presiona Enter..." />
+    <button id="sendBtn" type="submit">Enviar</button>
+  </form>
 </div>
 
 <script>
-const WEBHOOK = "https://evin8n.app.n8n.cloud/webhook/looker-chat";
+  // ==================== CONFIG ====================
+  const WEBHOOK = "https://evin8n.app.n8n.cloud/webhook/looker-chat";
+  const API_KEY = ""; // opcional: si usas Header Auth en n8n, pon aquí tu x-api-key
 
-function addMsg(text, cls) {
-  const d = document.createElement("div");
-  d.className = "msg " + cls;
-  d.innerText = text;
-  document.getElementById("messages").appendChild(d);
-}
+  // ============== UTILIDADES DE RENDER ==============
+  // Escapa HTML para evitar XSS
+  function escapeHTML(s) {
+    return s.replace(/[&<>"']/g, ch => (
+      { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]
+    ));
+  }
 
-async function send() {
-  const q = document.getElementById("q").value;
-  addMsg("Tú: " + q, "user");
-  document.getElementById("q").value = "";
+  // Markdown muy básico: **negritas**, [texto](url) y saltos de línea
+  function markdownToHTML(s) {
+    // 1) Escapar HTML primero
+    let out = escapeHTML(String(s ?? ""));
+    // 2) Enlaces [texto](url)
+    out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    // 3) Negritas **texto**
+    out = out.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // 4) Saltos de línea
+    out = out.replace(/\n/g, '<br>');
+    return out;
+  }
 
-  const r = await fetch(WEBHOOK, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question: q })
+  // Auto-scroll al final
+  function scrollToBottom() {
+    const m = document.getElementById("messages");
+    m.scrollTop = m.scrollHeight;
+  }
+
+  // Añadir mensaje
+  function addMsg(role, content, isMarkdown = false) {
+    const messages = document.getElementById("messages");
+    const wrap = document.createElement("div");
+    wrap.className = `msg ${role}`;
+    const roleEl = document.createElement("span");
+    roleEl.className = "role";
+    roleEl.textContent = role === "user" ? "Tú:" : "E‑Vin:";
+    const bubble = document.createElement("span");
+    bubble.className = "bubble";
+    bubble.innerHTML = isMarkdown ? markdownToHTML(content) : escapeHTML(content);
+    wrap.appendChild(roleEl);
+    wrap.appendChild(bubble);
+    messages.appendChild(wrap);
+    scrollToBottom();
+  }
+
+  // Mostrar estado/transición
+  function setLoading(loading) {
+    const btn = document.getElementById("sendBtn");
+    btn.disabled = loading;
+    btn.textContent = loading ? "Enviando..." : "Enviar";
+  }
+
+  // ============== ENVÍO & MANEJO DE RESPUESTA ==============
+  async function sendPrompt(q) {
+    setLoading(true);
+    try {
+      const headers = { "Content-Type": "application/json" };
+      if (API_KEY) headers["x-api-key"] = API_KEY;
+
+      const res = await fetch(WEBHOOK, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ question: q })
+      });
+
+      // Intentar parsear JSON; si falla, pasar a texto
+      let data, text;
+      try {
+        data = await res.json();
+      } catch {
+        text = await res.text();
+      }
+
+      // RUTAS DE RESPUESTA COMPATIBLES:
+      // 1) Contrato "mejorado": { answer_markdown, answer_text, ... }
+      // 2) Contrato simple: { answer: "...markdown o texto..." }
+      // 3) Texto plano (markdown) directo
+      let payload = "";
+
+      if (data && typeof data === "object") {
+        if (typeof data.answer_markdown === "string" && data.answer_markdown.trim()) {
+          payload = data.answer_markdown;
+          addMsg("bot", payload, true);
+          return;
+        }
+        if (typeof data.answer === "string" && data.answer.trim()) {
+          payload = data.answer;
+          addMsg("bot", payload, true);
+          return;
+        }
+        // Si vino un objeto distinto, muéstralo de forma segura
+        payload = JSON.stringify(data, null, 2);
+        addMsg("bot", payload, false);
+        return;
+      }
+
+      // Texto plano (posible markdown)
+      if (typeof text === "string" && text.trim()) {
+        addMsg("bot", text, true);
+        return;
+      }
+
+      // Fallback
+      addMsg("bot", "No recibí contenido utilizable desde el servicio.", false);
+
+    } catch (err) {
+      console.error(err);
+      addMsg("bot", "Ocurrió un error de red o de servidor. Intenta de nuevo.", false);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ============== UI: eventos ==============
+  document.getElementById("f").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = document.getElementById("q");
+    const q = input.value.trim();
+    if (!q) return;
+    addMsg("user", q, false);
+    input.value = "";
+    sendPrompt(q);
   });
 
-  const j = await r.json();
-  addMsg("E-Vin: " + j.answer, "bot");
-}
+  // Enviar con Enter
+  document.getElementById("q").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      document.getElementById("sendBtn").click();
+    }
+  });
 </script>
 
 </body>
-
 </html>
+
 
 
 
